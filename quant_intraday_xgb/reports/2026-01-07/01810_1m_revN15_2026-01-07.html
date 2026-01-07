@@ -1,0 +1,128 @@
+<html><head><meta charset='utf-8'><title>Daily Reversal Report</title></head><body>
+<h2>Daily Reversal Model Report</h2>
+<p><b>Date:</b> 2026-01-07 &nbsp; <b>Symbol:</b> 01810 &nbsp; <b>Bar:</b> 1m</p>
+<p><b>RevCfg:</b> N=15, K=15, theta=0.005</p>
+<h3>Decision: SKIP ❌</h3>
+<p><code>lift=4.93, top20=0.424, PR-AUC=0.931, Brier=0.0200</code></p>
+<h3>Metrics (test split)</h3>
+<style type="text/css">
+</style>
+<table id="T_a23fa">
+  <thead>
+    <tr>
+      <th id="T_a23fa_level0_col0" class="col_heading level0 col0" >base_rate</th>
+      <th id="T_a23fa_level0_col1" class="col_heading level0 col1" >top20_rate</th>
+      <th id="T_a23fa_level0_col2" class="col_heading level0 col2" >lift_top20</th>
+      <th id="T_a23fa_level0_col3" class="col_heading level0 col3" >auc_pr</th>
+      <th id="T_a23fa_level0_col4" class="col_heading level0 col4" >auc_roc</th>
+      <th id="T_a23fa_level0_col5" class="col_heading level0 col5" >brier</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td id="T_a23fa_row0_col0" class="data row0 col0" >0.086</td>
+      <td id="T_a23fa_row0_col1" class="data row0 col1" >0.424</td>
+      <td id="T_a23fa_row0_col2" class="data row0 col2" >4.93</td>
+      <td id="T_a23fa_row0_col3" class="data row0 col3" >0.931</td>
+      <td id="T_a23fa_row0_col4" class="data row0 col4" >0.990</td>
+      <td id="T_a23fa_row0_col5" class="data row0 col5" >0.0200</td>
+    </tr>
+  </tbody>
+</table>
+
+<h3>Decile bucket (test split)</h3>
+<table border="1" class="dataframe">
+  <thead>
+    <tr style="text-align: right;">
+      <th>bucket</th>
+      <th>count</th>
+      <th>real_reversal_rate</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>(-0.000611, 0.000697]</td>
+      <td>30</td>
+      <td>0.000000</td>
+    </tr>
+    <tr>
+      <td>(0.000697, 0.000999]</td>
+      <td>29</td>
+      <td>0.000000</td>
+    </tr>
+    <tr>
+      <td>(0.000999, 0.00139]</td>
+      <td>29</td>
+      <td>0.000000</td>
+    </tr>
+    <tr>
+      <td>(0.00139, 0.00189]</td>
+      <td>29</td>
+      <td>0.000000</td>
+    </tr>
+    <tr>
+      <td>(0.00189, 0.00336]</td>
+      <td>29</td>
+      <td>0.000000</td>
+    </tr>
+    <tr>
+      <td>(0.00336, 0.00548]</td>
+      <td>29</td>
+      <td>0.000000</td>
+    </tr>
+    <tr>
+      <td>(0.00548, 0.0135]</td>
+      <td>29</td>
+      <td>0.000000</td>
+    </tr>
+    <tr>
+      <td>(0.0135, 0.0646]</td>
+      <td>29</td>
+      <td>0.000000</td>
+    </tr>
+    <tr>
+      <td>(0.0646, 0.37]</td>
+      <td>29</td>
+      <td>0.068966</td>
+    </tr>
+    <tr>
+      <td>(0.37, 0.984]</td>
+      <td>29</td>
+      <td>0.793103</td>
+    </tr>
+  </tbody>
+</table>
+<p><img src='01810_1m_revN15_2026-01-07_bucket.png' style='max-width: 100%; height: auto;'></p>
+<h3>Aligned path (test split)</h3>
+<p><img src='01810_1m_revN15_2026-01-07_aligned.png' style='max-width: 100%; height: auto;'></p>
+<h3>Configs (json)</h3>
+<pre>
+{
+  "date": "2026-01-07",
+  "config": {
+    "symbol": "01810",
+    "bar_size": "1m",
+    "horizon_bars": 3,
+    "hold_bars": 2,
+    "prob_long": 0.6,
+    "prob_flat": 0.5,
+    "fee_bps": 8.0,
+    "slippage_bps": 2.0,
+    "train_days": 45,
+    "test_days": 15,
+    "data_source": "yfinance",
+    "yfinance_period": "8d"
+  },
+  "rev_config": {
+    "N": 15,
+    "K": 15,
+    "theta": 0.005,
+    "ema_fast": 12,
+    "ema_slow": 26,
+    "ema_signal": 9,
+    "vwap_win": 20,
+    "vol_win": 20
+  }
+}
+</pre>
+</body></html>
