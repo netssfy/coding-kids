@@ -9,6 +9,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import joblib
+import argparse  # [新增] 用于接收命令行参数 n
 
 # 你已有的
 from daily_train_reversal import RevConfig, make_reversal_features
@@ -29,6 +30,7 @@ class MasterParquetProvider(BarProvider):
     从 data/master 读一份大表，然后按时间切片
     要求 master index 是 datetime（你现在就是）
     """
+
     def __init__(self, master_path: Path):
         self.master_path = master_path
         self._cache = None
@@ -76,14 +78,15 @@ def load_model_bundle(model_path: Path) -> ModelBundle:
 @dataclass
 class ReplayConfig:
     symbol: str = "1810.HK"
-    p_threshold: float = 0.6      # 触发信号阈值（建议可用 top20 分位替代）
-    hold_minutes: int = 10        # 简单策略：入场后持有 N 分钟
-    cooldown_minutes: int = 0     # 平仓后冷却 N 分钟再允许开新仓
+    p_threshold: float = 0.6  # 触发信号阈值（建议可用 top20 分位替代）
+    hold_minutes: int = 10  # 简单策略：入场后持有 N 分钟
+    cooldown_minutes: int = 0  # 平仓后冷却 N 分钟再允许开新仓
+    n: int = 1  # [新增] 连续 n 次超过阈值才开仓
 
 
 @dataclass
 class PositionState:
-    side: int = 0                 # +1 long, -1 short, 0 flat
+    side: int = 0  # +1 long, -1 short, 0 flat
     entry_time: pd.Timestamp | None = None
     entry_price: float | None = None
     hold_until: pd.Timestamp | None = None
@@ -224,6 +227,10 @@ def replay_one_day(
     rows = []
     cum_pnl = 0.0
 
+    # [新增] 信号计数器变量
+    signal_counter = 0
+    pending_side = 0  # 正在等待确认的方向 (1 for long, -1 for short)
+
     for t in bars_T.index:
         # 用 t-1 的完整bar 做预测
         t_pred = t - pd.Timedelta(minutes=1)
@@ -243,17 +250,46 @@ def replay_one_day(
         pos, action_close, pnl = maybe_close_position(pos, t, price_now, cfg)
         cum_pnl += pnl
 
-        # 再检查是否开仓（用 t-1 的信号，在 t 执行）
-        price_entry = price_now
-        pos, action_open = maybe_open_position(pos, t, price_entry, p, dir_t, cfg)
+        # [新增] 逻辑：计算信号是否连续出现 n 次
+        # 1. 判断当前时刻是否有原始信号
+        raw_signal_side = 0
+        if np.isfinite(p) and p >= cfg.p_threshold and dir_t != 0:
+            raw_signal_side = -dir_t  # 策略逻辑：反转方向
+
+        # 2. 更新计数器
+        if raw_signal_side != 0:
+            if raw_signal_side == pending_side:
+                signal_counter += 1
+            else:
+                # 方向变了（或者之前无信号），重置并计数为1
+                pending_side = raw_signal_side
+                signal_counter = 1
+        else:
+            # 信号消失
+            signal_counter = 0
+            pending_side = 0
+
+        # 3. 再检查是否开仓（仅当 count >= n 时调用开仓逻辑）
+        # 注意：maybe_open_position 内部还会检查 p >= threshold，这没问题，只要这里传进去的 p 是合格的
+        action_open = "wait_signal"
+        if signal_counter >= cfg.n:
+            price_entry = price_now
+            # 这里的 p 和 dir_t 肯定是满足条件的，所以 maybe_open_position 会通过校验
+            pos, action_open = maybe_open_position(pos, t, price_entry, p, dir_t, cfg)
+        else:
+            if raw_signal_side != 0:
+                action_open = f"accumulating({signal_counter}/{cfg.n})"
+            else:
+                action_open = "no_signal"
 
         side = pos.side
         rows.append({
             "t_exec": t.strftime("%Y-%m-%d %H:%M:%S"),
             "t_pred": t_pred.strftime("%Y-%m-%d %H:%M:%S"),
             "p_reversal": p,
-            "direction": dir_t,                  # +1 上行段，-1 下行段
+            "direction": dir_t,  # +1 上行段，-1 下行段
             "signal_side": (-dir_t if (np.isfinite(p) and p >= cfg.p_threshold and dir_t != 0) else 0),
+            "signal_count": signal_counter,  # [新增] 记录当前的计数
             "pos_side": side,
             "action_close": action_close,
             "action_open": action_open,
@@ -270,16 +306,23 @@ def replay_one_day(
 # 5) CLI入口
 # -----------------------------
 def main():
+    # [新增] 参数解析
+    parser = argparse.ArgumentParser()
+    parser.add_argument("-n", "--n", type=int, default=1, help="连续 n 次超过阈值才开仓")
+    args = parser.parse_args()
+
     cfg = Config()
     rev_cfg = RevConfig(N=15, K=15, theta=0.005)
 
     project_root = Path(__file__).resolve().parents[1]
 
     # 你要回放哪一天 T
-    day_T = "2026-01-07"  # 改成你要的日期
+    day_T = "2026-01-08"  # 改成你要的日期
+    args.n=1
+    args.pt=80
 
     # 模型：通常用 T-1 收盘后训练的模型预测 T
-    model_path = project_root / "models" / f"{cfg.symbol}_{cfg.bar_size}_revN{rev_cfg.N}_{day_T}.joblib"
+    model_path = project_root / "models" / f"{cfg.symbol}_{cfg.bar_size}_revN{rev_cfg.N}_t{rev_cfg.theta}_{day_T}.joblib"
     if not model_path.exists():
         raise FileNotFoundError(f"model not found: {model_path}")
 
@@ -288,9 +331,11 @@ def main():
     master_path = project_root / "data" / "master" / f"{cfg.symbol}_{cfg.bar_size}_master.parquet"
     provider = MasterParquetProvider(master_path)
 
-    replayCfg = ReplayConfig(symbol=cfg.symbol, p_threshold=0.6, hold_minutes=10)
+    # [修改] 传入 n 参数
+    replayCfg = ReplayConfig(symbol=cfg.symbol, p_threshold=args.pt / 100, hold_minutes=10, n=args.n)
 
-    out_csv = project_root / "data" / "replay" / f"{cfg.symbol}_{cfg.bar_size}_replay_{day_T}.csv"
+    # [修改] 文件名加入 n
+    out_csv = project_root / "data" / "replay" / f"{cfg.symbol}_{cfg.bar_size}_replay_{day_T}_n{args.n}_pt{args.pt}.csv"
 
     df = replay_one_day(provider, model_bundle, day_T, replayCfg, out_csv)
     print("Saved replay:", out_csv)

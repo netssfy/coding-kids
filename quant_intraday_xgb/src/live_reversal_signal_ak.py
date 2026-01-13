@@ -39,10 +39,16 @@ def sleep_until_next_minute(buffer_seconds: int = 2):
 # -----------------------------
 def load_model_bundle(model_path: Path):
     bundle = joblib.load(model_path)
-    model = bundle["model"]
+
+    cls_model = bundle["model"]
     feature_cols = bundle["feature_columns"]
     rev_cfg = RevConfig(**bundle["rev_cfg"]) if isinstance(bundle["rev_cfg"], dict) else bundle["rev_cfg"]
-    return model, feature_cols, rev_cfg, bundle
+
+    reg_model = bundle.get("reg_model", None)
+    reg_target = bundle.get("reg_target", None)
+
+    return cls_model, feature_cols, rev_cfg, reg_model, reg_target, bundle
+
 
 
 # -----------------------------
@@ -50,54 +56,58 @@ def load_model_bundle(model_path: Path):
 # -----------------------------
 def latest_signal_from_bars_tminus1(
     bars: pd.DataFrame,
-    model,
+    cls_model,
     feature_cols: list[str],
     rev_cfg: RevConfig,
+    reg_model=None,
+    reg_target: str | None = None,
     p_threshold: float = 0.6,
+    amp_threshold: float = 0.006,   # 例如：预测未来N分钟振幅至少 0.6% 才做
 ):
-    """
-    bars: 必须包含 open/high/low/close/volume，index 为分钟级 datetime
-    返回：ts_used(用于预测的bar时间=t-1), p, side, reason
-    """
     if len(bars) < max(rev_cfg.vwap_win, rev_cfg.vol_win, rev_cfg.K) + 5:
-        return None, np.nan, 0, "not_enough_bars"
+        return None, np.nan, np.nan, 0, "not_enough_bars"
 
-    # 只用到“最后一个已闭合bar”
-    ts_use = bars.index[-1]  # 我们外部已经确保 bars 截止到 last_closed_minute
+    ts_use = bars.index[-1]
     bars_upto = bars.loc[:ts_use]
 
-    # 特征全量算（数据量不大时最稳）
     X = make_reversal_features(bars_upto, rev_cfg)
     if ts_use not in X.index:
-        return ts_use, np.nan, 0, "feature_ts_missing"
+        return ts_use, np.nan, np.nan, 0, "feature_ts_missing"
 
     x_last = X.loc[[ts_use], feature_cols].copy()
     if not np.isfinite(x_last.values).all():
-        return ts_use, np.nan, 0, "features_not_ready"
+        return ts_use, np.nan, np.nan, 0, "features_not_ready"
 
-    # 方向（用 close[t] - close[t-K]）
+    # ---- 分类概率：是否反转 ----
+    p = float(cls_model.predict_proba(x_last)[:, 1][0])
+
+    # ---- 回归幅度：未来N分钟振幅/上行/下行等 ----
+    amp_pred = np.nan
+    if reg_model is not None:
+        amp_pred = float(reg_model.predict(x_last)[0])   # pred_range_amp / pred_up_amp ...
+
+    # ---- 方向：用 close[t]-close[t-K] ----
     close = bars_upto["close"].astype(float)
     mom = close.loc[ts_use] - close.shift(rev_cfg.K).loc[ts_use]
-    if not np.isfinite(mom) or mom == 0:
-        direction = 0
-    else:
-        direction = 1 if mom > 0 else -1
+    direction = 0 if (not np.isfinite(mom) or mom == 0) else (1 if mom > 0 else -1)
 
-    p = float(model.predict_proba(x_last)[:, 1][0])
+    # ---- 交易决策：p 过阈值 + 幅度也够大 ----
+    if direction != 0 and p >= p_threshold:
+        if np.isfinite(amp_pred) and amp_pred < amp_threshold:
+            return ts_use, p, amp_pred, 0, f"p ok but amp_pred={amp_pred:.6f} < {amp_threshold:.6f}"
 
-    if p >= p_threshold and direction != 0:
-        side = -direction  # 反转方向
-        return ts_use, p, side, f"p>={p_threshold} & dir={direction} => side={side}"
+        side = -direction
+        return ts_use, p, amp_pred, side, f"OPEN side={side} p={p:.3f} amp_pred={amp_pred:.6f}"
 
-    return ts_use, p, 0, "below_threshold_or_no_dir"
+    return ts_use, p, amp_pred, 0, "below_threshold_or_no_dir"
 
 
-def emit_signal(log_path: Path, ts: pd.Timestamp, p: float, side: int, reason: str):
-    log_path.parent.mkdir(parents=True, exist_ok=True)
 
+def emit_signal(log_path: Path, ts: pd.Timestamp, p: float, amp_pred: float, side: int, reason: str, reg_target: str | None):
     row = {
         "datetime_str": ts.strftime("%Y-%m-%d %H:%M:%S"),
         "p_reversal": p,
+        "amp_pred": amp_pred,
         "side": side,
         "action": "BUY" if side == 1 else ("SELL" if side == -1 else "HOLD"),
         "reason": reason,
@@ -109,21 +119,23 @@ def emit_signal(log_path: Path, ts: pd.Timestamp, p: float, side: int, reason: s
     df.to_csv(log_path, mode="a", header=header, index=False)
 
 
+
 # -----------------------------
 # 5) 主循环：每分钟拉取数据并预测 t-1
 # -----------------------------
 def main():
     cfg = Config()
     model_N = 15
+    theta = 0.005
 
     project_root = Path(__file__).resolve().parents[1]
 
     today = now_hk().date().strftime("%Y-%m-%d")
-    model_path = project_root / "models" / f"{cfg.symbol}_1m_revN{model_N}_{today}.joblib"
+    model_path = project_root / "models" / f"{cfg.symbol}_1m_revN{model_N}_t{theta}_{today}.joblib"
     if not model_path.exists():
         raise FileNotFoundError(f"model not found: {model_path}\n请先跑 daily_train_reversal.py 生成当天模型")
 
-    model, feature_cols, rev_cfg, _ = load_model_bundle(model_path)
+    cls_model, feature_cols, rev_cfg, reg_model, reg_target, _ = load_model_bundle(model_path)
     print(f"[model] loaded: {model_path}")
     print(f"[model] rev_cfg={rev_cfg}, feature_cols={len(feature_cols)}")
 
@@ -154,18 +166,24 @@ def main():
 
         # 严格对齐到 ts_last：只用已闭合bar
         bars = bars.loc[:ts_last]
-        print(f"last bar {bars.iloc[-1]}")
+        print(f"last bar at {bars.iloc[-1].name}")
 
         if last_emitted_ts is not None and ts_last <= last_emitted_ts:
             continue
 
-        ts_use, p, side, reason = latest_signal_from_bars_tminus1(
-            bars, model, feature_cols, rev_cfg, p_threshold=p_threshold
+        ts_use, p, amp_pred, side, reason = latest_signal_from_bars_tminus1(
+            bars,
+            cls_model,
+            feature_cols,
+            rev_cfg,
+            reg_model=reg_model,
+            reg_target=reg_target,
+            p_threshold=p_threshold,
+            amp_threshold=0.006,  # 你可以用训练集 top20_mean/阈值来定
         )
 
         if ts_use is not None:
-            emit_signal(log_path, ts_use, p, side, reason)
-            last_emitted_ts = ts_last
+            emit_signal(log_path, ts_use, p, amp_pred, side, reason, reg_target)
 
 
 if __name__ == "__main__":

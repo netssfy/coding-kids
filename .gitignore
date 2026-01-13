@@ -1,1 +1,4 @@
 /quant_intraday_xgb/.venv/
+/quant_intraday_xgb/data/
+/quant_intraday_xgb/models/
+/quant_intraday_xgb/reports/

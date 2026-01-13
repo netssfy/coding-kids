@@ -111,6 +111,38 @@ def make_reversal_label(bars: pd.DataFrame, cfg: RevConfig) -> pd.Series:
     return y
 
 
+def make_future_amp_targets(bars: pd.DataFrame, cfg: RevConfig) -> pd.DataFrame:
+    close = bars["close"].astype(float)
+    hi = bars["high"].astype(float)
+    lo = bars["low"].astype(float)
+
+    # 方向：用过去K根
+    mom = close - close.shift(cfg.K)
+    direction = np.sign(mom).replace(0, np.nan)  # +1 上行段, -1 下行段
+
+    fut_max = hi.shift(-1).rolling(cfg.N, min_periods=cfg.N).max()
+    fut_min = lo.shift(-1).rolling(cfg.N, min_periods=cfg.N).min()
+
+    # 未来“向上/向下”可达幅度（都是正数）
+    up_amp   = fut_max / close - 1.0
+    down_amp = close / fut_min - 1.0
+
+    # 反转方向幅度：dir=+1(之前涨) -> 看 down_amp；dir=-1(之前跌) -> 看 up_amp
+    rev_amp = np.where(direction > 0, down_amp, np.where(direction < 0, up_amp, np.nan))
+
+    out = pd.DataFrame({
+        "direction": direction,
+        "fut_max": fut_max,
+        "fut_min": fut_min,
+        "up_amp": up_amp,
+        "down_amp": down_amp,
+        "rev_amp": rev_amp,   # ✅ 与方向关联（反转方向的可达幅度，正数）
+    }, index=bars.index)
+
+    out.replace([np.inf, -np.inf], np.nan, inplace=True)
+    return out
+
+
 def train_reversal_model(X: pd.DataFrame, y: pd.Series):
     import xgboost as xgb
 
@@ -133,9 +165,35 @@ def train_reversal_model(X: pd.DataFrame, y: pd.Series):
     return model
 
 
+def train_regressor(X: pd.DataFrame, y: pd.Series):
+    import xgboost as xgb
+
+    model = xgb.XGBRegressor(
+        n_estimators=800,
+        max_depth=4,
+        learning_rate=0.05,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        reg_lambda=1.0,
+        min_child_weight=20,
+        objective="reg:squarederror",
+        n_jobs=4,
+        random_state=42,
+        tree_method="hist",
+        missing=np.nan,
+    )
+    model.fit(X, y, verbose=False)
+    return model
+
+
 def predict_reversal_proba(model, X: pd.DataFrame) -> pd.Series:
     p = model.predict_proba(X)[:, 1]
     return pd.Series(p, index=X.index, name="p_reversal")
+
+
+def predict_reg(model, X: pd.DataFrame, name: str) -> pd.Series:
+    pred = model.predict(X)
+    return pd.Series(pred, index=X.index, name=name)
 
 
 def avg_future_reversal_path(full_df: pd.DataFrame, start_mask: pd.Series, K: int, horizon: int = 15) -> np.ndarray:
@@ -446,7 +504,11 @@ def decision_line(metrics: pd.DataFrame) -> tuple[str, str]:
 
 def save_html_report(report_path: Path, cfg: Config, rev_cfg: RevConfig, date_tag: str,
                      metrics: pd.DataFrame, bt: pd.DataFrame, bucket_png: Path, aligned_png: Path,
-                     decision: tuple[str, str]):
+                     decision: tuple[str, str],
+                     reg_target: str,
+                     reg_metrics: pd.DataFrame,
+                     reg_top: pd.DataFrame,
+                     reg_bt: pd.DataFrame):
     report_path.parent.mkdir(parents=True, exist_ok=True)
     dec, reason = decision
 
@@ -478,6 +540,19 @@ def save_html_report(report_path: Path, cfg: Config, rev_cfg: RevConfig, date_ta
     html.append("<h3>Aligned path (test split)</h3>")
     html.append(f"<p><img src='{aligned_png.name}' style='max-width: 100%; height: auto;'></p>")
 
+    html.append(f"<h3>Regression (test split): target = {reg_target}</h3>")
+    html.append("<p>Predict future N-bar amplitude using the same features.</p>")
+
+    html.append("<h4>Regression metrics</h4>")
+    html.append(_df_to_html_table(reg_metrics, float_fmt="{:.6f}"))
+
+    html.append("<h4>Top20 lift (real amplitude)</h4>")
+    html.append(_df_to_html_table(reg_top, float_fmt="{:.6f}"))
+
+    html.append("<h4>Decile bucket by predicted amplitude</h4>")
+    html.append(reg_bt.to_html(index=False))
+
+
     html.append("<h3>Configs (json)</h3>")
     html.append("<pre>")
     html.append(json.dumps({
@@ -491,6 +566,97 @@ def save_html_report(report_path: Path, cfg: Config, rev_cfg: RevConfig, date_ta
     report_path.write_text("\n".join(html), encoding="utf-8")
 
 
+def evaluate_regression_metrics(eval_df: pd.DataFrame, y_col: str, pred_col: str) -> pd.DataFrame:
+    """
+    eval_df: 必须包含 y_col(真实) 和 pred_col(预测)
+    输出：常用回归指标 + 信息含量指标
+    """
+    y = eval_df[y_col].astype(float).values
+    p = eval_df[pred_col].astype(float).values
+
+    mask = np.isfinite(y) & np.isfinite(p)
+    y = y[mask]
+    p = p[mask]
+
+    if len(y) < 10:
+        return pd.DataFrame([{
+            "mae": np.nan,
+            "rmse": np.nan,
+            "r2": np.nan,
+            "pearson": np.nan,
+            "rank_ic": np.nan,
+        }])
+
+    mae = float(np.mean(np.abs(p - y)))
+    rmse = float(np.sqrt(np.mean((p - y) ** 2)))
+
+    # R2 = 1 - SSE/SST
+    y_mean = float(np.mean(y))
+    sse = float(np.sum((p - y) ** 2))
+    sst = float(np.sum((y - y_mean) ** 2))
+    r2 = float(1.0 - sse / (sst + 1e-12))
+
+    # Pearson（线性相关）
+    pearson = float(np.corrcoef(p, y)[0, 1])
+
+    # RankIC（Spearman近似：对 rank 做 Pearson）
+    pr = pd.Series(p).rank(pct=True).values
+    yr = pd.Series(y).rank(pct=True).values
+    rank_ic = float(np.corrcoef(pr, yr)[0, 1])
+
+    return pd.DataFrame([{
+        "mae": mae,
+        "rmse": rmse,
+        "r2": r2,
+        "pearson": pearson,
+        "rank_ic": rank_ic,
+    }])
+
+def regression_bucket_table(eval_df: pd.DataFrame, y_col: str, pred_col: str, q: int = 10) -> pd.DataFrame:
+    """
+    用预测值 pred_col 分桶，看真实 y_col 是否单调上升。
+    """
+    tmp = eval_df[[y_col, pred_col]].copy()
+    tmp["bucket"] = pd.qcut(tmp[pred_col], q, duplicates="drop")
+    out = (
+        tmp.groupby("bucket", observed=True)
+        .agg(
+            count=(y_col, "count"),
+            y_mean=(y_col, "mean"),
+            y_median=(y_col, "median"),
+            pred_mean=(pred_col, "mean"),
+        )
+        .reset_index()
+    )
+    return out
+
+
+def regression_topk_lift(eval_df: pd.DataFrame, y_col: str, pred_col: str, top_q: float = 0.2) -> pd.DataFrame:
+    """
+    Top-K 的真实幅度提升：top_q=0.2 -> top20%
+    """
+    tmp = eval_df[[y_col, pred_col]].dropna().copy()
+    base = float(tmp[y_col].mean())
+    thr = tmp[pred_col].quantile(1 - top_q)
+    top = tmp[tmp[pred_col] >= thr]
+    top_mean = float(top[y_col].mean()) if len(top) else np.nan
+    lift = (top_mean / base) if base > 0 else np.nan
+
+    return pd.DataFrame([{
+        "base_mean": base,
+        f"top{int(top_q*100)}_mean": top_mean,
+        f"lift_top{int(top_q*100)}": lift,
+        "top_threshold": float(thr),
+        "top_count": int(len(top)),
+    }])
+
+def _df_to_html_table(df: pd.DataFrame, float_fmt: str = "{:.4f}") -> str:
+    df2 = df.copy()
+    for c in df2.columns:
+        if pd.api.types.is_float_dtype(df2[c]) or pd.api.types.is_integer_dtype(df2[c]):
+            df2[c] = df2[c].apply(lambda x: float_fmt.format(x) if pd.notnull(x) else "")
+    return df2.to_html(index=False, escape=False)
+
 # ============================================================
 # 3) Main
 # ============================================================
@@ -498,9 +664,12 @@ def save_html_report(report_path: Path, cfg: Config, rev_cfg: RevConfig, date_ta
 def main():
     # 1) 读你的 Config（沿用你项目结构）
     cfg = Config()
+    rev_cfg = RevConfig(N=15, K=15, theta=0.005)
 
     root = Path(__file__).resolve().parents[1]
     date_tag = run_date_str("Asia/Hong_Kong")
+
+    name_prefix = f"{cfg.symbol}_{cfg.bar_size}_revN{rev_cfg.N}_t{rev_cfg.theta}_{date_tag}"
 
     # 2) 下载并保存快照（文件名带日期）
     bars_new = load_or_download_latest(cfg, root, date_tag)
@@ -511,8 +680,6 @@ def main():
     # 4) 用 master 训练
     bars = pd.read_parquet(master_path).sort_index()
     bars = bars[~bars.index.duplicated(keep="last")]
-
-    rev_cfg = RevConfig(N=15, K=15, theta=0.005)
 
     # 特征 & 标签（复用昨天版本）
     X = make_reversal_features(bars, rev_cfg)
@@ -541,12 +708,55 @@ def main():
     bt = bucket_table(eval_df)
     dec = decision_line(metrics)
 
+    # ===== 回归：未来N分钟幅度预测（用相同features）=====
+    tgt = make_future_amp_targets(bars, rev_cfg)
+
+    # 和 X/y 的dropna对齐：用同一份 df 的 index 再 join targets
+    df_reg = X.join(tgt).dropna()
+
+    tr_r, te_r = time_split_df(df_reg, ratio=0.8)
+    Xr_tr = tr_r[X2.columns]
+    Xr_te = te_r[X2.columns]
+
+    # 选择你要预测哪个目标：up_amp / down_amp / rev_amp
+    yreg_name = "rev_amp"
+    yr_tr = tr_r[yreg_name].astype(float)
+    yr_te = te_r[yreg_name].astype(float)
+
+    reg = train_regressor(Xr_tr, yr_tr)
+
+    pred_te = predict_reg(reg, Xr_te, name=f"pred_{yreg_name}")
+
+    # ---- 回归 eval_df（用于 report）----
+    reg_eval_df = pd.DataFrame(
+        {yreg_name: yr_te.values, f"pred_{yreg_name}": pred_te.values},
+        index=Xr_te.index
+    ).dropna()
+
+    reg_metrics = evaluate_regression_metrics(reg_eval_df, y_col=yreg_name, pred_col=f"pred_{yreg_name}")
+    reg_bt = regression_bucket_table(reg_eval_df, y_col=yreg_name, pred_col=f"pred_{yreg_name}", q=10)
+    reg_top = regression_topk_lift(reg_eval_df, y_col=yreg_name, pred_col=f"pred_{yreg_name}", top_q=0.2)
+
+    # 控制台也打一下（简洁）
+    m0 = reg_metrics.iloc[0].to_dict()
+    print(
+        f"\nregression(test) target={yreg_name}: "
+        f"MAE={m0['mae']:.6f}, RMSE={m0['rmse']:.6f}, "
+        f"Corr={m0['pearson']:.3f}, RankIC={m0['rank_ic']:.3f}, R2={m0['r2']:.3f}"
+    )
+    t0 = reg_top.iloc[0].to_dict()
+    print(
+        f"regression top20 lift: base_mean={t0['base_mean']:.6f}, "
+        f"top20_mean={t0['top20_mean']:.6f}, lift={t0['lift_top20']:.2f}, "
+        f"thr={t0['top_threshold']:.6f}, top_count={t0['top_count']}"
+    )
+
     # 7) 画图（bucket + aligned path）
     reports_dir = root / "reports" / date_tag
     reports_dir.mkdir(parents=True, exist_ok=True)
 
-    bucket_png = reports_dir / f"{cfg.symbol}_{cfg.bar_size}_revN{rev_cfg.N}_{date_tag}_bucket.png"
-    aligned_png = reports_dir / f"{cfg.symbol}_{cfg.bar_size}_revN{rev_cfg.N}_{date_tag}_aligned.png"
+    bucket_png = reports_dir / f"{name_prefix}_bucket.png"
+    aligned_png = reports_dir / f"{name_prefix}_aligned.png"
 
     plot_bucket_bar(bt, bucket_png, title=f"Decile bucket: {cfg.symbol} {cfg.bar_size} (test split)")
 
@@ -559,7 +769,7 @@ def main():
     models_dir = root / "models"
     models_dir.mkdir(parents=True, exist_ok=True)
 
-    model_path = models_dir / f"{cfg.symbol}_{cfg.bar_size}_revN{rev_cfg.N}_{date_tag}.joblib"
+    model_path = models_dir / f"{name_prefix}.joblib"
     joblib.dump({
         "date": date_tag,
         "symbol": cfg.symbol,
@@ -567,11 +777,21 @@ def main():
         "rev_cfg": asdict(rev_cfg),
         "feature_columns": list(X2.columns),
         "model": model,
+        # 回归：幅度
+        "reg_target": yreg_name,
+        "reg_model": reg,
     }, model_path)
 
     # 9) 保存报告（HTML）
-    report_path = reports_dir / f"{cfg.symbol}_{cfg.bar_size}_revN{rev_cfg.N}_{date_tag}.html"
-    save_html_report(report_path, cfg, rev_cfg, date_tag, metrics, bt, bucket_png, aligned_png, dec)
+    report_path = reports_dir / f"{name_prefix}.html"
+    save_html_report(
+        report_path, cfg, rev_cfg, date_tag,
+        metrics, bt, bucket_png, aligned_png, dec,
+        reg_target=yreg_name,
+        reg_metrics=reg_metrics,
+        reg_top=reg_top,
+        reg_bt=reg_bt,
+    )
 
     # 10) 控制台输出（简洁、决策友好）
     print("\n=== Daily Train Summary ===")
